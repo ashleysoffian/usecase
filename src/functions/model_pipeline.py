@@ -8,10 +8,12 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from functions.model import ModelTrainer
+
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, KFold, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, RobustScaler, StandardScaler
 
@@ -258,6 +260,97 @@ class ModelPipeline:
 		if not results:
 			raise ValueError("results is empty")
 
+	@staticmethod
+	def evaluate_classification_pipe(
+		pipeline_or_result: PipelineTrainResult | GridSearchCV | PipelineBundle | Pipeline,
+		X_train: Any,
+		y_train: Any,
+		X_test: Any,
+		y_test: Any,
+		*,
+		average: Literal["binary", "macro", "weighted"] | None = None,
+		metric_set: Literal["default", "imbalanced", "balanced", "all"] = "default",
+		metrics: list[str] | tuple[str, ...] | None = None,
+		pos_label: Any = 1,
+		decimals: int = 3,
+	) -> pd.DataFrame:
+		"""Create a train/test evaluation table for a fitted classification pipeline."""
+		pipe = ModelPipeline._unwrap_pipeline(pipeline_or_result)
+		return ModelTrainer.evaluate_classification(
+			pipe,
+			X_train,
+			y_train,
+			X_test,
+			y_test,
+			average=average,
+			metric_set=metric_set,
+			metrics=metrics,
+			pos_label=pos_label,
+			decimals=decimals,
+		)
+
+	@staticmethod
+	def evaluate_classification_all_pipe(
+		results: dict[str, PipelineTrainResult] | dict[str, Any],
+		X_train: Any,
+		y_train: Any,
+		X_test: Any,
+		y_test: Any,
+		*,
+		average: Literal["binary", "macro", "weighted"] | None = None,
+		metric_set: Literal["default", "imbalanced", "balanced", "all"] = "default",
+		metrics: list[str] | tuple[str, ...] | None = None,
+		pos_label: Any = 1,
+		decimals: int = 3,
+		# Fit-status labeling
+		fit_metric: str = "recall",
+		overfit_gap: float = 0.10,
+		overfit_train_min: float = 0.85,
+		underfit_max: float = 0.60,
+		add_gap_column: bool = True,
+		sort_by: str | None = None,
+	) -> pd.DataFrame:
+		"""Evaluate every classification pipeline returned by `train_classification_all`.
+
+		Accepts either:
+		- dict[name -> PipelineTrainResult]
+		- dict[name -> fitted Pipeline]
+		"""
+		if not results:
+			raise ValueError("results is empty")
+
+		pipes: dict[str, Any] = {}
+		for name, obj in results.items():
+			if isinstance(obj, PipelineTrainResult):
+				pipes[name] = obj.best_estimator
+			elif isinstance(obj, GridSearchCV):
+				pipes[name] = obj.best_estimator_
+			elif isinstance(obj, Pipeline):
+				pipes[name] = obj
+			elif hasattr(obj, "best_estimator"):
+				pipes[name] = obj.best_estimator  # type: ignore[assignment]
+			else:
+				pipes[name] = obj
+
+		return ModelTrainer.evaluate_classification_all(
+			results=pipes,
+			X_train=X_train,
+			y_train=y_train,
+			X_test=X_test,
+			y_test=y_test,
+			average=average,
+			metric_set=metric_set,
+			metrics=metrics,
+			pos_label=pos_label,
+			decimals=decimals,
+			fit_metric=fit_metric,
+			overfit_gap=overfit_gap,
+			overfit_train_min=overfit_train_min,
+			underfit_max=underfit_max,
+			add_gap_column=add_gap_column,
+			sort_by=sort_by,
+		)
+
 		frames: list[pd.DataFrame] = []
 		for name, res in results.items():
 			metrics = ModelPipeline.evaluate_regression_pipe(
@@ -424,6 +517,16 @@ class ModelPipeline:
 		return {}
 
 	@staticmethod
+	def _make_cv(*, cv: int, random_state: int, stratified: bool):
+		"""Create a CV splitter.
+
+		For classification, stratified folds help preserve class balance.
+		"""
+		if stratified:
+			return StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_state)
+		return KFold(n_splits=cv, shuffle=True, random_state=random_state)
+
+	@staticmethod
 	def _grid_search_pipeline(
 		*,
 		name: str,
@@ -431,7 +534,7 @@ class ModelPipeline:
 		param_grid: dict[str, list[Any]],
 		X_train: Any,
 		y_train: Any,
-		cv: int,
+		cv: Any,
 		scoring: str | None,
 		n_jobs: int,
 		verbose: int,
@@ -467,6 +570,7 @@ class ModelPipeline:
 		*,
 		X_train: Any,
 		y_train: Any,
+		feature_engineer: TransformerMixin | None = None,
 		model_types: tuple[ModelType, ...] = ("linear", "random_forest", "xgboost"),
 		numeric_features: list[str] | None = None,
 		categorical_features: list[str] | None = None,
@@ -500,6 +604,7 @@ class ModelPipeline:
 			pipe = ModelPipeline.build(
 				task="regression",
 				model_type=mt,
+				feature_engineer=feature_engineer,
 				numeric_features=numeric_features,
 				categorical_features=categorical_features,
 				log_columns=log_columns,
@@ -539,6 +644,7 @@ class ModelPipeline:
 		*,
 		X_train: Any,
 		y_train: Any,
+		feature_engineer: TransformerMixin | None = None,
 		model_types: tuple[ModelType, ...] = ("logistic", "random_forest", "xgboost"),
 		numeric_features: list[str] | None = None,
 		categorical_features: list[str] | None = None,
@@ -555,9 +661,15 @@ class ModelPipeline:
 		n_jobs: int = -1,
 		verbose: int = 0,
 		refit: bool = True,
+		stratified_cv: bool = True,
 		model_kwargs: dict[str, Any] | None = None,
 	) -> dict[str, PipelineTrainResult]:
-		"""Train multiple classification pipelines (like `model.py` train_classification)."""
+		"""Train multiple classification pipelines (like `model.py` train_classification).
+
+		If `stratified_cv=True`, uses StratifiedKFold for GridSearchCV.
+		If False, uses plain KFold.
+		"""
+		cv_obj = ModelPipeline._make_cv(cv=cv, random_state=random_state, stratified=stratified_cv)
 		results: dict[str, PipelineTrainResult] = {}
 		for mt in model_types:
 			kwargs = dict(ModelPipeline._default_model_kwargs(model_type=mt, random_state=random_state, n_jobs=n_jobs))
@@ -567,6 +679,7 @@ class ModelPipeline:
 			pipe = ModelPipeline.build(
 				task="classification",
 				model_type=mt,
+				feature_engineer=feature_engineer,
 				numeric_features=numeric_features,
 				categorical_features=categorical_features,
 				log_columns=log_columns,
@@ -592,7 +705,7 @@ class ModelPipeline:
 				param_grid=grid,
 				X_train=X_train,
 				y_train=y_train,
-				cv=cv,
+				cv=cv_obj,
 				scoring=scoring,
 				n_jobs=n_jobs,
 				verbose=verbose,
@@ -606,6 +719,7 @@ class ModelPipeline:
 		*,
 		task: TaskType,
 		model_type: ModelType,
+		feature_engineer: TransformerMixin | None = None,
 		numeric_features: list[str] | None = None,
 		categorical_features: list[str] | None = None,
 		# log transform
@@ -718,7 +832,12 @@ class ModelPipeline:
 		else:
 			model = base_model
 
-		return Pipeline(steps=[("preprocess", preprocess), ("model", model)])
+		steps: list[tuple[str, Any]] = []
+		if feature_engineer is not None:
+			steps.append(("feature_engineer", feature_engineer))
+		steps.append(("preprocess", preprocess))
+		steps.append(("model", model))
+		return Pipeline(steps=steps)
 
 	@staticmethod
 	def default_param_grid(
@@ -747,6 +866,7 @@ class ModelPipeline:
 				f"{prefix}C": [0.01, 0.1, 1.0, 10.0],
 				f"{prefix}penalty": ["l2"],
 				f"{prefix}solver": ["lbfgs"],
+				f"{prefix}class_weight": [None, "balanced"],
 				f"{prefix}max_iter": [1000],
 			}
 
@@ -766,6 +886,7 @@ class ModelPipeline:
 				f"{prefix}min_samples_split": [2, 5, 10],
 				f"{prefix}min_samples_leaf": [1, 2, 4],
 				f"{prefix}max_features": ["sqrt", "log2", None],
+				f"{prefix}class_weight": [None, "balanced"],
 			}
 
 		if model_type == "xgboost" and task == "regression":
@@ -788,6 +909,7 @@ class ModelPipeline:
 				f"{prefix}colsample_bytree": [0.8, 1.0],
 				f"{prefix}reg_lambda": [1.0, 10.0],
 				f"{prefix}min_child_weight": [1, 5],
+				f"{prefix}scale_pos_weight": [1.0, 5.0, 10.0],
 			}
 
 		return {}

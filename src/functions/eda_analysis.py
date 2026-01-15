@@ -193,7 +193,7 @@ class EDA_Analysis:
         """
         Generate descriptive statistics table as a matplotlib figure.
 
-        - Numeric columns: count, missing, mean, std, min, 25%, 50%, 75%, max
+        - Numeric columns: count, missing, unique, mean, std, min, 25%, 50%, 75%, max
         - Non-numeric columns: count, missing, unique, top, freq
 
         Args:
@@ -232,6 +232,12 @@ class EDA_Analysis:
             non_null = int(s.notna().sum())
             missing = int(s.isna().sum())
 
+            try:
+                unique_count = int(s.nunique(dropna=True))
+            except TypeError:
+                # Fallback for unhashable values (e.g., lists/dicts in cells)
+                unique_count = int(s.astype("string").nunique(dropna=True))
+
             row = {
                 "#": i,
                 "Column": col,
@@ -244,7 +250,7 @@ class EDA_Analysis:
                 "50%": "",
                 "75%": "",
                 "Max": "",
-                "Unique": "",
+                "Unique": unique_count,
                 "Top": "",
                 "Freq": "",
                 "Dtype": str(s.dtype),
@@ -268,7 +274,6 @@ class EDA_Analysis:
                 d = s.astype("object").describe()
                 row.update(
                     {
-                        "Unique": _fmt(d.get("unique")),
                         "Top": _fmt(d.get("top")),
                         "Freq": _fmt(d.get("freq")),
                     }
@@ -706,6 +711,212 @@ class EDA_Analysis:
                 continue
 
         return figs
+
+    @staticmethod
+    def binary_bar_plot(data, variables=None, combined=False):
+        """Generate bar plots for binary variable distribution.
+
+        A "binary" variable is defined here as having exactly 2 unique non-null
+        values (missing values are ignored for the binary check).
+
+        Args:
+            data (DataFrame): Input dataframe
+            variables (list/tuple/set, optional): Specific columns to consider. Defaults to all columns.
+            combined (bool, optional): If True, combine all plots into one figure. Defaults to False.
+
+        Returns:
+            Figure or list: Single figure if combined=True, list of figures otherwise
+        """
+        if variables is not None and not isinstance(variables, (list, tuple, set)):
+            raise TypeError("variables must be a list/tuple/set of column names or None")
+
+        cols = data.columns.tolist() if variables is None else [c for c in variables if c in data.columns]
+        if not cols:
+            return [] if not combined else None
+
+        binary_cols = []
+        for col in cols:
+            s = data[col]
+            try:
+                nunique = int(s.dropna().nunique())
+            except TypeError:
+                nunique = int(s.dropna().astype("string").nunique())
+            if nunique == 2:
+                binary_cols.append(col)
+
+        if not binary_cols:
+            return [] if not combined else None
+
+        def _ordered_index(idx):
+            values = list(idx)
+            # Prefer sensible ordering for common binary patterns.
+            try:
+                if all(isinstance(v, (bool, np.bool_)) for v in values):
+                    ordered = [v for v in [False, True] if v in values]
+                    return ordered if len(ordered) == len(values) else values
+                # Try numeric ordering (e.g., 0/1)
+                return sorted(values, key=lambda x: float(x))
+            except Exception:
+                return values
+
+        def _plot_one(ax, series: pd.Series, title: str, *, compact: bool):
+            non_null = series.dropna()
+            if non_null.empty:
+                ax.set_visible(False)
+                return
+
+            s = non_null.astype("object")
+            value_counts = s.value_counts(dropna=False)
+            if value_counts.empty:
+                ax.set_visible(False)
+                return
+
+            order = _ordered_index(value_counts.index)
+            value_counts = value_counts.reindex(order)
+
+            x = np.arange(len(value_counts))
+            colors = [COLORS["primary"], COLORS["secondary"]]
+            bar_colors = [colors[i % len(colors)] for i in range(len(value_counts))]
+            bars = ax.bar(
+                x,
+                value_counts.values,
+                color=bar_colors,
+                edgecolor="white",
+                alpha=0.85,
+            )
+
+            total_non_null = int(non_null.shape[0])
+            for bar in bars:
+                height = bar.get_height()
+                pct = (height / total_non_null) if total_non_null else 0.0
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    height,
+                    f"{int(height)} ({pct:.0%})",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8 if compact else 9,
+                )
+
+            ax.set_xticks(x)
+            ax.set_xticklabels([str(v) for v in value_counts.index], fontsize=9)
+            ax.grid(True, alpha=0.3, linestyle="--", linewidth=0.5, axis="y")
+
+            missing = int(series.isna().sum())
+            ax.text(
+                0.98,
+                0.98,
+                f"Non-null: {total_non_null} | Missing: {missing}",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, pad=0.3),
+            )
+
+            EDA_Analysis._set_plot_style(ax, title=title, xlabel="", ylabel="Count")
+
+        if combined:
+            n_plots = len(binary_cols)
+            grid_cols = min(2, n_plots)
+            grid_rows = (n_plots + grid_cols - 1) // grid_cols
+
+            fig, axes = plt.subplots(grid_rows, grid_cols, figsize=(10, 4 * grid_rows))
+            axes = np.atleast_1d(axes).ravel()
+
+            for idx, col in enumerate(binary_cols):
+                try:
+                    _plot_one(axes[idx], data[col], col, compact=True)
+                except (TypeError, ValueError):
+                    axes[idx].set_visible(False)
+
+            for idx in range(len(binary_cols), len(axes)):
+                axes[idx].set_visible(False)
+
+            fig.suptitle("Binary Variable Distribution", fontsize=14, fontweight="bold", y=1.00)
+            fig.tight_layout()
+            plt.close(fig)
+            return fig
+
+        figs = []
+        for col in binary_cols:
+            try:
+                fig, ax = plt.subplots(figsize=(8, 4))
+                _plot_one(ax, data[col], f"Binary Distribution: {col}", compact=False)
+                fig.tight_layout()
+                figs.append(fig)
+                plt.close(fig)
+            except (TypeError, ValueError):
+                continue
+
+        return figs
+
+    @staticmethod
+    def binary_crosstab_with_target(
+        data: pd.DataFrame,
+        target: str,
+        variables=None,
+        *,
+        normalize: str | bool = "index",
+        include_missing: bool = False,
+    ) -> pd.DataFrame:
+        """Create crosstabs for all binary variables against a target.
+
+        Equivalent to running, for each binary column `col`:
+            `pd.crosstab(df[col], df[target], normalize='index')`
+
+        A "binary" variable is defined as a column having exactly 2 unique non-null
+        values (missing values are ignored for the binary check).
+
+        Args:
+            data: Input dataframe
+            target: Target column name
+            variables: Optional list/tuple/set of columns to consider. Defaults to all columns.
+            normalize: Passed through to `pd.crosstab(normalize=...)`.
+                Common values: 'index' (row-wise), 'columns', 'all', or False/None.
+            include_missing: If True, treats missing values as a '<missing>' category
+                for both feature and target.
+
+        Returns:
+            A single DataFrame formed by concatenating crosstabs for each binary column.
+            The index is a MultiIndex: (feature, feature_value).
+        """
+        if target not in data.columns:
+            raise ValueError(f"Target '{target}' not found in dataframe")
+
+        if variables is not None and not isinstance(variables, (list, tuple, set)):
+            raise TypeError("variables must be a list/tuple/set of column names or None")
+
+        cols = data.columns.tolist() if variables is None else [c for c in variables if c in data.columns]
+        cols = [c for c in cols if c != target]
+        if not cols:
+            return pd.DataFrame()
+
+        binary_cols: list[str] = []
+        for col in cols:
+            s = data[col]
+            try:
+                nunique = int(s.dropna().nunique())
+            except TypeError:
+                nunique = int(s.dropna().astype("string").nunique())
+            if nunique == 2:
+                binary_cols.append(col)
+
+        if not binary_cols:
+            return pd.DataFrame()
+
+        tables: dict[str, pd.DataFrame] = {}
+        for col in binary_cols:
+            x = data[col]
+            y = data[target]
+            if include_missing:
+                x = x.astype("object").where(x.notna(), "<missing>")
+                y = y.astype("object").where(y.notna(), "<missing>")
+
+            tables[col] = pd.crosstab(x, y, normalize=normalize)
+
+        out = pd.concat(tables, axis=0, names=["feature", "value"])
+        return out
 
     @staticmethod
     def categorical_target_boxplot(data, categorical_var, target='price', combined=False):

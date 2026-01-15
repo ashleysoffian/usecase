@@ -31,6 +31,29 @@ class Model_Interpretability:
 		return pd.DataFrame(X_arr, columns=feature_names)
 
 	@staticmethod
+	def _estimator_feature_names(estimator: Any) -> list[str] | None:
+		"""Best-effort feature names from fitted estimators."""
+		names = getattr(estimator, "feature_names_in_", None)
+		if names is None:
+			return None
+		try:
+			return [str(x) for x in list(names)]
+		except Exception:
+			return None
+
+	@staticmethod
+	def _call_explainer(explainer: Any, X: Any, *, check_additivity: bool) -> Any:
+		"""Call a SHAP explainer, retrying when additivity check fails."""
+		try:
+			return explainer(X, check_additivity=check_additivity)
+		except Exception as exc:
+			msg = str(exc)
+			# TreeExplainer additivity check can fail due to numerical tolerance.
+			if check_additivity and ("Additivity check failed" in msg or "ExplainerError" in msg):
+				return explainer(X, check_additivity=False)
+			raise
+
+	@staticmethod
 	def _maybe_sample(
 		X: pd.DataFrame,
 		*,
@@ -70,6 +93,7 @@ class Model_Interpretability:
 		max_samples: int | None = 2000,
 		random_state: int = 42,
 		class_index: int | None = None,
+		check_additivity: bool = True,
 		plot_type: Literal["dot", "bar"] = "dot",
 		title: str | None = None,
 		show: bool = False,
@@ -79,11 +103,13 @@ class Model_Interpretability:
 		Returns a matplotlib Figure.
 		"""
 		estimator = Model_Interpretability._unwrap_estimator(model)
-		X_df = Model_Interpretability._ensure_dataframe(X)
+		X_df = Model_Interpretability._ensure_dataframe(
+			X, feature_names=Model_Interpretability._estimator_feature_names(estimator)
+		)
 		X_eval = Model_Interpretability._maybe_sample(X_df, max_samples=max_samples, random_state=random_state)
 
 		explainer = shap.Explainer(estimator, X_eval)
-		shap_values = explainer(X_eval)
+		shap_values = Model_Interpretability._call_explainer(explainer, X_eval, check_additivity=check_additivity)
 		shap_values = Model_Interpretability._select_output(shap_values, class_index=class_index)
 
 		fig = plt.figure(figsize=(8, 5))
@@ -102,6 +128,7 @@ class Model_Interpretability:
 		max_samples: int | None = 2000,
 		random_state: int = 42,
 		class_index: int | None = None,
+		check_additivity: bool = True,
 		title: str | None = None,
 		show: bool = False,
 	):
@@ -110,11 +137,13 @@ class Model_Interpretability:
 		Returns a matplotlib Figure.
 		"""
 		estimator = Model_Interpretability._unwrap_estimator(model)
-		X_df = Model_Interpretability._ensure_dataframe(X)
+		X_df = Model_Interpretability._ensure_dataframe(
+			X, feature_names=Model_Interpretability._estimator_feature_names(estimator)
+		)
 		X_eval = Model_Interpretability._maybe_sample(X_df, max_samples=max_samples, random_state=random_state)
 
 		explainer = shap.Explainer(estimator, X_eval)
-		shap_values = explainer(X_eval)
+		shap_values = Model_Interpretability._call_explainer(explainer, X_eval, check_additivity=check_additivity)
 		shap_values = Model_Interpretability._select_output(shap_values, class_index=class_index)
 
 		fig, ax = plt.subplots(figsize=(7, 5))
@@ -139,6 +168,7 @@ class Model_Interpretability:
 		row_index: int = 0,
 		max_display: int = 15,
 		class_index: int | None = None,
+		check_additivity: bool = True,
 		title: str | None = None,
 		show: bool = False,
 	):
@@ -147,7 +177,9 @@ class Model_Interpretability:
 		Returns a matplotlib Figure.
 		"""
 		estimator = Model_Interpretability._unwrap_estimator(model)
-		X_df = Model_Interpretability._ensure_dataframe(X)
+		X_df = Model_Interpretability._ensure_dataframe(
+			X, feature_names=Model_Interpretability._estimator_feature_names(estimator)
+		)
 		if row_index < 0 or row_index >= len(X_df):
 			raise IndexError("row_index out of range")
 
@@ -156,7 +188,7 @@ class Model_Interpretability:
 		explainer = shap.Explainer(estimator, background)
 
 		row = X_df.iloc[[row_index]]
-		shap_row = explainer(row)
+		shap_row = Model_Interpretability._call_explainer(explainer, row, check_additivity=check_additivity)
 		shap_row = Model_Interpretability._select_output(shap_row, class_index=class_index)
 
 		fig = plt.figure(figsize=(8, 5))

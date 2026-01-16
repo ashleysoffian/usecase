@@ -14,6 +14,8 @@ from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.metrics import (
 	accuracy_score,
+	confusion_matrix,
+	ConfusionMatrixDisplay,
 	f1_score,
 	mean_absolute_error,
 	mean_squared_error,
@@ -41,6 +43,7 @@ ClassificationScoring = Literal[
 	"accuracy",
 	"f1",
 	"f1_macro",
+	"recall",
 	"roc_auc",
 ]
 
@@ -88,6 +91,7 @@ class Model_Training:
 			"C": [0.01, 0.1, 1.0, 10.0],
 			"penalty": ["l2"],
 			"solver": ["lbfgs"],
+			"class_weight": [None, "balanced"],
 			"max_iter": [1000],
 		},
 		"random_forest": {
@@ -96,6 +100,7 @@ class Model_Training:
 			"min_samples_split": [2, 5, 10],
 			"min_samples_leaf": [1, 2, 4],
 			"max_features": ["sqrt", "log2", None],
+			"class_weight": [None, "balanced"],
 		},
 		"xgboost": {
 			"n_estimators": [200, 500],
@@ -105,6 +110,7 @@ class Model_Training:
 			"colsample_bytree": [0.8, 1.0],
 			"reg_lambda": [1.0, 10.0],
 			"min_child_weight": [1, 5],
+			"scale_pos_weight": [1.0, 5.0, 10.0],
 		},
 	}
 
@@ -823,11 +829,28 @@ class ModelTrainer:
 		y_test: Any,
 		*,
 		average: Literal["binary", "macro", "weighted"] | None = None,
+		metric_set: Literal["default", "imbalanced", "balanced", "all"] = "default",
+		metrics: list[str] | tuple[str, ...] | None = None,
+		pos_label: Any = 1,
 		decimals: int = 2,
 	) -> pd.DataFrame:
 		"""Create a train/test evaluation table for classification.
 
-		Adds ROC-AUC columns when `predict_proba` is available.
+		Supports selectable metric sets to make the function usable for both
+		imbalanced and balanced datasets.
+
+		Metric selection:
+		- metric_set='default': accuracy, precision, recall, f1 (+ roc_auc when available)
+		- metric_set='imbalanced': recall, f1, roc_auc, confusion_matrix
+		- metric_set='balanced': accuracy, precision, recall, f1, roc_auc, confusion_matrix
+		- metric_set='all': accuracy, precision, recall, f1, roc_auc, confusion_matrix
+		- metrics: explicit list/tuple of metric names overrides metric_set
+
+		Confusion matrix output:
+		- Binary: adds columns tn, fp, fn, tp
+		- Multi-class: adds a 'confusion_matrix' column with list-of-lists
+
+		ROC-AUC is included only when `predict_proba` is available.
 		"""
 		estimator = ModelTrainer._unwrap_estimator(estimator)
 		if not hasattr(estimator, "predict"):
@@ -843,49 +866,216 @@ class ModelTrainer:
 		yhat_train = estimator.predict(X_train)
 		yhat_test = estimator.predict(X_test)
 
-		out = pd.DataFrame(
-			{
-				"accuracy": [
-					float(accuracy_score(y_train, yhat_train)),
-					float(accuracy_score(y_test, yhat_test)),
-				],
-				"precision": [
-					float(precision_score(y_train, yhat_train, average=average, zero_division=0)),
-					float(precision_score(y_test, yhat_test, average=average, zero_division=0)),
-				],
-				"recall": [
-					float(recall_score(y_train, yhat_train, average=average, zero_division=0)),
-					float(recall_score(y_test, yhat_test, average=average, zero_division=0)),
-				],
-				"f1": [
-					float(f1_score(y_train, yhat_train, average=average, zero_division=0)),
-					float(f1_score(y_test, yhat_test, average=average, zero_division=0)),
-				],
-			},
-			index=["train", "test"],
-		)
+		if metrics is not None:
+			if not isinstance(metrics, (list, tuple)):
+				raise TypeError("metrics must be a list/tuple of metric names or None")
+			selected = [str(m).lower().strip() for m in metrics]
+		else:
+			metric_set = str(metric_set).lower().strip()
+			if metric_set == "default":
+				selected = ["accuracy", "precision", "recall", "f1"]
+			elif metric_set == "imbalanced":
+				selected = ["recall", "f1", "roc_auc", "confusion_matrix"]
+			elif metric_set in ("balanced", "all"):
+				selected = ["accuracy", "precision", "recall", "f1", "roc_auc", "confusion_matrix"]
+			else:
+				raise ValueError("metric_set must be one of: 'default', 'imbalanced', 'balanced', 'all'")
 
-		if hasattr(estimator, "predict_proba"):
+		# Pre-compute probabilities if ROC-AUC requested.
+		need_proba = any(m in ("roc_auc", "roc_auc_ovr_weighted") for m in selected)
+		p_train = p_test = None
+		if need_proba and hasattr(estimator, "predict_proba"):
 			try:
 				p_train = estimator.predict_proba(X_train)
 				p_test = estimator.predict_proba(X_test)
-
-				if is_binary:
-					out["roc_auc"] = [
-						float(roc_auc_score(y_train, p_train[:, 1])),
-						float(roc_auc_score(y_test, p_test[:, 1])),
-					]
-				else:
-					out["roc_auc_ovr_weighted"] = [
-						float(roc_auc_score(y_train, p_train, multi_class="ovr", average="weighted")),
-						float(roc_auc_score(y_test, p_test, multi_class="ovr", average="weighted")),
-					]
 			except Exception:
-				# If ROC-AUC can't be computed (missing proba, label format, etc.), omit it.
-				pass
+				p_train = p_test = None
+
+		def _score_kwargs():
+			# Only pass pos_label when using binary averaging.
+			if average == "binary":
+				return {"average": average, "zero_division": 0, "pos_label": pos_label}
+			return {"average": average, "zero_division": 0}
+
+		cols: dict[str, list[Any]] = {}
+		for m in selected:
+			if m == "accuracy":
+				cols["accuracy"] = [
+					float(accuracy_score(y_train, yhat_train)),
+					float(accuracy_score(y_test, yhat_test)),
+				]
+			elif m == "precision":
+				cols["precision"] = [
+					float(precision_score(y_train, yhat_train, **_score_kwargs())),
+					float(precision_score(y_test, yhat_test, **_score_kwargs())),
+				]
+			elif m == "recall":
+				cols["recall"] = [
+					float(recall_score(y_train, yhat_train, **_score_kwargs())),
+					float(recall_score(y_test, yhat_test, **_score_kwargs())),
+				]
+			elif m == "f1":
+				cols["f1"] = [
+					float(f1_score(y_train, yhat_train, **_score_kwargs())),
+					float(f1_score(y_test, yhat_test, **_score_kwargs())),
+				]
+			elif m == "roc_auc":
+				# Include only when proba available.
+				if p_train is None or p_test is None:
+					continue
+				try:
+					if is_binary:
+						# Choose the column that corresponds to pos_label when possible.
+						pos_idx = 1
+						classes_ = getattr(estimator, "classes_", None)
+						if classes_ is not None:
+							classes_list = list(classes_)
+							if pos_label in classes_list:
+								pos_idx = classes_list.index(pos_label)
+						cols["roc_auc"] = [
+							float(roc_auc_score(y_train, p_train[:, pos_idx])),
+							float(roc_auc_score(y_test, p_test[:, pos_idx])),
+						]
+					else:
+						cols["roc_auc_ovr_weighted"] = [
+							float(roc_auc_score(y_train, p_train, multi_class="ovr", average="weighted")),
+							float(roc_auc_score(y_test, p_test, multi_class="ovr", average="weighted")),
+						]
+				except Exception:
+					# If ROC-AUC can't be computed (label format, proba shape, etc.), omit it.
+					pass
+			elif m == "confusion_matrix":
+				try:
+					cm_train = confusion_matrix(y_train, yhat_train)
+					cm_test = confusion_matrix(y_test, yhat_test)
+					if is_binary and cm_train.shape == (2, 2) and cm_test.shape == (2, 2):
+						tn_tr, fp_tr, fn_tr, tp_tr = cm_train.ravel().tolist()
+						tn_te, fp_te, fn_te, tp_te = cm_test.ravel().tolist()
+						cols["tn"] = [int(tn_tr), int(tn_te)]
+						cols["fp"] = [int(fp_tr), int(fp_te)]
+						cols["fn"] = [int(fn_tr), int(fn_te)]
+						cols["tp"] = [int(tp_tr), int(tp_te)]
+					else:
+						cols["confusion_matrix"] = [cm_train.tolist(), cm_test.tolist()]
+				except Exception:
+					pass
+			else:
+				raise ValueError(
+					f"Unknown metric {m!r}. Supported: accuracy, precision, recall, f1, roc_auc, confusion_matrix"
+				)
+
+		out = pd.DataFrame(cols, index=["train", "test"])
 
 		if decimals is not None:
 			out = out.round(decimals)
+		return out
+
+	@staticmethod
+	def evaluate_classification_all(
+		results: dict[str, Any],
+		X_train: Any,
+		y_train: Any,
+		X_test: Any,
+		y_test: Any,
+		*,
+		average: Literal["binary", "macro", "weighted"] | None = None,
+		metric_set: Literal["default", "imbalanced", "balanced", "all"] = "default",
+		metrics: list[str] | tuple[str, ...] | None = None,
+		pos_label: Any = 1,
+		decimals: int = 3,
+		# Fit-status labeling
+		fit_metric: str = "recall",
+		overfit_gap: float = 0.10,
+		overfit_train_min: float = 0.85,
+		underfit_max: float = 0.60,
+		add_gap_column: bool = True,
+		sort_by: str | None = None,
+	) -> pd.DataFrame:
+		"""Evaluate multiple classification models and return a single summary table.
+
+		This calls `evaluate_classification(...)` for each model, then flattens the
+		(train/test) rows into `train_<metric>` / `test_<metric>` columns.
+
+		Adds:
+		- model: model name
+		- fit_status: one of {overfit, underfit, ideal, unknown}
+		- optionally: gap_<fit_metric> = train - test
+
+		Fit-status heuristic (on `fit_metric`):
+		- overfit: (train - test) >= overfit_gap AND train >= overfit_train_min
+		- underfit: train <= underfit_max AND test <= underfit_max
+		- ideal: otherwise
+
+		Args:
+			results: dict[name -> TrainResult or fitted estimator]
+			fit_metric: metric to judge fit quality (e.g., recall, f1, accuracy, roc_auc)
+			sort_by: column name to sort by (e.g., "test_recall"); defaults to "test_<fit_metric>" when present.
+		"""
+		results = ModelTrainer._as_estimator_dict(results)
+		rows: list[dict[str, Any]] = []
+		fit_metric = str(fit_metric).lower().strip()
+
+		def _flatten_metrics(df: pd.DataFrame) -> dict[str, Any]:
+			out: dict[str, Any] = {}
+			for col in df.columns:
+				out[f"train_{col}"] = df.loc["train", col]
+				out[f"test_{col}"] = df.loc["test", col]
+			return out
+
+		for name, res in results.items():
+			eval_df = ModelTrainer.evaluate_classification(
+				res,
+				X_train,
+				y_train,
+				X_test,
+				y_test,
+				average=average,
+				metric_set=metric_set,
+				metrics=metrics,
+				pos_label=pos_label,
+				decimals=decimals,
+			)
+			flat = _flatten_metrics(eval_df)
+			flat["model"] = name
+
+			train_key = f"train_{fit_metric}"
+			test_key = f"test_{fit_metric}"
+			train_val = flat.get(train_key, np.nan)
+			test_val = flat.get(test_key, np.nan)
+			try:
+				train_f = float(train_val)
+				test_f = float(test_val)
+			except Exception:
+				train_f = float("nan")
+				test_f = float("nan")
+
+			gap = train_f - test_f if (np.isfinite(train_f) and np.isfinite(test_f)) else float("nan")
+			if add_gap_column:
+				flat[f"gap_{fit_metric}"] = gap
+
+			if not (np.isfinite(train_f) and np.isfinite(test_f)):
+				flat["fit_status"] = "unknown"
+			elif gap >= overfit_gap and train_f >= overfit_train_min:
+				flat["fit_status"] = "overfit"
+			elif train_f <= underfit_max and test_f <= underfit_max:
+				flat["fit_status"] = "underfit"
+			else:
+				flat["fit_status"] = "ideal"
+
+			rows.append(flat)
+
+		out = pd.DataFrame(rows)
+		# Put key identifiers first.
+		front = [c for c in ["model", "fit_status"] if c in out.columns]
+		rest = [c for c in out.columns if c not in front]
+		out = out[front + rest]
+
+		if sort_by is None:
+			candidate = f"test_{fit_metric}"
+			sort_by = candidate if candidate in out.columns else None
+		if sort_by is not None and sort_by in out.columns:
+			out = out.sort_values(by=sort_by, ascending=False, na_position="last").reset_index(drop=True)
+
 		return out
 
 	@staticmethod
@@ -968,6 +1158,275 @@ class ModelTrainer:
 		RocCurveDisplay.from_estimator(estimator, X, y, ax=ax)
 		ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1, color="gray")
 		ax.set_title(title)
+		fig.tight_layout()
+		return fig
+
+	@staticmethod
+	def plot_confusion_matrix(
+		estimator: Any,
+		X: Any,
+		y: Any,
+		*,
+		labels: list[Any] | None = None,
+		normalize: Literal["true", "pred", "all"] | None = None,
+		cmap: str = "Blues",
+		title: str = "Confusion Matrix",
+	):
+		"""Plot a confusion matrix (binary or multiclass).
+
+		Args:
+			estimator: Fitted estimator or TrainResult.
+			X: Features (typically test split).
+			y: True labels.
+			labels: Optional list of labels to index the matrix.
+			normalize: Normalize confusion matrix over the true (rows), predicted (cols), or all.
+			cmap: Matplotlib colormap name.
+			title: Plot title.
+
+		Returns:
+			Matplotlib Figure.
+		"""
+		try:
+			import matplotlib.pyplot as plt
+		except Exception as exc:  # pragma: no cover
+			raise ImportError("Plotting requires matplotlib.") from exc
+
+		estimator = ModelTrainer._unwrap_estimator(estimator)
+		if not hasattr(estimator, "predict"):
+			raise TypeError("estimator must implement predict() (or be a TrainResult)")
+
+		y_pred = estimator.predict(X)
+		fig, ax = plt.subplots(figsize=(6, 5))
+		ConfusionMatrixDisplay.from_predictions(
+			y_true=y,
+			y_pred=y_pred,
+			labels=labels,
+			normalize=normalize,
+			cmap=cmap,
+			ax=ax,
+			colorbar=True,
+		)
+		# sklearn adds minor ticks + minor grid to draw cell borders; remove them
+		# to avoid the extra inner square lines.
+		ax.grid(False, which="both")
+		ax.set_xticks([], minor=True)
+		ax.set_yticks([], minor=True)
+		ax.tick_params(which="minor", bottom=False, left=False)
+		ax.set_title(title)
+		fig.tight_layout()
+		return fig
+
+	@staticmethod
+	def _as_estimator_dict(models: Any) -> dict[str, Any]:
+		"""Normalize input to a dict[name] -> estimator/TrainResult."""
+		if isinstance(models, dict):
+			return models
+		raise TypeError("models must be a dict[name -> estimator or TrainResult]")
+
+	@staticmethod
+	def _score_single_model(
+		estimator: Any,
+		X: Any,
+		y: Any,
+		*,
+		metric: Literal["roc_auc", "recall", "f1", "accuracy"] = "roc_auc",
+		average: Literal["binary", "macro", "weighted"] | None = None,
+		pos_label: Any = 1,
+	) -> float:
+		"""Compute a selection score for choosing the best model."""
+		est = ModelTrainer._unwrap_estimator(estimator)
+		y_arr = np.asarray(y)
+		classes = np.unique(y_arr)
+		is_binary = len(classes) == 2
+		if average is None:
+			average = "binary" if is_binary else "weighted"
+
+		metric = str(metric).lower().strip()  # type: ignore[assignment]
+		if metric == "accuracy":
+			y_hat = est.predict(X)
+			return float(accuracy_score(y, y_hat))
+		if metric == "recall":
+			y_hat = est.predict(X)
+			kwargs = {"average": average, "zero_division": 0}
+			if average == "binary":
+				kwargs["pos_label"] = pos_label
+			return float(recall_score(y, y_hat, **kwargs))
+		if metric == "f1":
+			y_hat = est.predict(X)
+			kwargs = {"average": average, "zero_division": 0}
+			if average == "binary":
+				kwargs["pos_label"] = pos_label
+			return float(f1_score(y, y_hat, **kwargs))
+		if metric == "roc_auc":
+			if not hasattr(est, "predict_proba"):
+				return float("nan")
+			try:
+				p = est.predict_proba(X)
+			except Exception:
+				return float("nan")
+			try:
+				if is_binary:
+					pos_idx = 1
+					classes_ = getattr(est, "classes_", None)
+					if classes_ is not None:
+						classes_list = list(classes_)
+						if pos_label in classes_list:
+							pos_idx = classes_list.index(pos_label)
+					return float(roc_auc_score(y, p[:, pos_idx]))
+				return float(roc_auc_score(y, p, multi_class="ovr", average="weighted"))
+			except Exception:
+				return float("nan")
+
+		raise ValueError("metric must be one of: 'roc_auc', 'recall', 'f1', 'accuracy'")
+
+	@staticmethod
+	def plot_roc_curves(
+		models: dict[str, Any],
+		X: Any,
+		y: Any,
+		*,
+		title: str = "ROC Curves",
+		best_only: bool = False,
+		select_by: Literal["roc_auc", "recall", "f1", "accuracy"] = "roc_auc",
+		average: Literal["binary", "macro", "weighted"] | None = None,
+		pos_label: Any = 1,
+	):
+		"""Plot ROC curves for multiple models on a single chart.
+
+		Args:
+			models: dict of name -> fitted estimator or TrainResult.
+			X, y: Evaluation data (typically test split).
+			title: Figure title.
+			best_only: If True, plots only the best model (by select_by on (X, y)).
+			select_by: Metric to choose the best model.
+			average: Used only for select_by when metric is recall/f1.
+			pos_label: Positive label used for binary select_by and ROC-AUC selection.
+
+		Returns:
+			Matplotlib Figure.
+		"""
+		try:
+			import matplotlib.pyplot as plt
+		except Exception as exc:  # pragma: no cover
+			raise ImportError("Plotting requires matplotlib.") from exc
+
+		models = ModelTrainer._as_estimator_dict(models)
+		y_arr = np.asarray(y)
+		if len(np.unique(y_arr)) != 2:
+			raise ValueError("plot_roc_curves supports binary classification only")
+
+		items = list(models.items())
+		if best_only:
+			scored = []
+			for name, est in items:
+				s = ModelTrainer._score_single_model(
+					est,
+					X,
+					y,
+					metric=select_by,
+					average=average,
+					pos_label=pos_label,
+				)
+				scored.append((name, est, s))
+			# Prefer finite scores; otherwise fall back to first.
+			finite = [(n, e, s) for (n, e, s) in scored if np.isfinite(s)]
+			best_name, best_est, _ = max(finite, key=lambda t: t[2]) if finite else scored[0]
+			items = [(best_name, best_est)]
+			title = f"{title} ({'best ' + str(select_by)})"
+
+		fig, ax = plt.subplots(figsize=(7, 5))
+		for name, est in items:
+			estimator = ModelTrainer._unwrap_estimator(est)
+			RocCurveDisplay.from_estimator(estimator, X, y, ax=ax, name=name)
+		ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1, color="gray")
+		ax.set_title(title)
+		fig.tight_layout()
+		return fig
+
+	@staticmethod
+	def plot_confusion_matrices(
+		models: dict[str, Any],
+		X: Any,
+		y: Any,
+		*,
+		title: str = "Confusion Matrices",
+		best_only: bool = False,
+		select_by: Literal["roc_auc", "recall", "f1", "accuracy"] = "roc_auc",
+		average: Literal["binary", "macro", "weighted"] | None = None,
+		pos_label: Any = 1,
+		labels: list[Any] | None = None,
+		normalize: Literal["true", "pred", "all"] | None = None,
+		cmap: str = "Blues",
+	):
+		"""Plot confusion matrices for multiple models.
+
+		Args:
+			models: dict of name -> fitted estimator or TrainResult.
+			X, y: Evaluation data (typically test split).
+			title: Figure title.
+			best_only: If True, plots only the best model (by select_by on (X, y)).
+			select_by: Metric to choose the best model.
+			average: Used only for select_by when metric is recall/f1.
+			pos_label: Positive label used for binary select_by.
+			labels: Optional list of labels to index the matrix.
+			normalize: Normalize confusion matrix over the true (rows), predicted (cols), or all.
+			cmap: Matplotlib colormap name.
+
+		Returns:
+			Matplotlib Figure.
+		"""
+		try:
+			import matplotlib.pyplot as plt
+		except Exception as exc:  # pragma: no cover
+			raise ImportError("Plotting requires matplotlib.") from exc
+
+		models = ModelTrainer._as_estimator_dict(models)
+		items = list(models.items())
+		if not items:
+			raise ValueError("models is empty")
+
+		if best_only:
+			scored = []
+			for name, est in items:
+				s = ModelTrainer._score_single_model(
+					est,
+					X,
+					y,
+					metric=select_by,
+					average=average,
+					pos_label=pos_label,
+				)
+				scored.append((name, est, s))
+			finite = [(n, e, s) for (n, e, s) in scored if np.isfinite(s)]
+			best_name, best_est, _ = max(finite, key=lambda t: t[2]) if finite else scored[0]
+			items = [(best_name, best_est)]
+			title = f"{title} ({'best ' + str(select_by)})"
+
+		n = len(items)
+		fig, axes = plt.subplots(1, n, figsize=(6 * n, 5))
+		if n == 1:
+			axes = [axes]
+
+		for ax, (name, est) in zip(axes, items):
+			estimator = ModelTrainer._unwrap_estimator(est)
+			y_pred = estimator.predict(X)
+			ConfusionMatrixDisplay.from_predictions(
+				y_true=y,
+				y_pred=y_pred,
+				labels=labels,
+				normalize=normalize,
+				cmap=cmap,
+				ax=ax,
+				colorbar=False,
+			)
+			# Remove inner cell grid lines (minor grid/ticks) for cleaner boxes.
+			ax.grid(False, which="both")
+			ax.set_xticks([], minor=True)
+			ax.set_yticks([], minor=True)
+			ax.tick_params(which="minor", bottom=False, left=False)
+			ax.set_title(name)
+
+		fig.suptitle(title, y=1.02)
 		fig.tight_layout()
 		return fig
 

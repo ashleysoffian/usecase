@@ -57,6 +57,9 @@ class ClassificationPipelineConfig:
 
 	# Raw-data pipeline options (for demo/prediction on raw inputs)
 	use_raw_pipeline: bool = False
+	# If True, also trains and returns fitted sklearn Pipelines (best_pipeline/pipelines)
+	# even when use_raw_pipeline=False. Note: this adds extra training time.
+	return_best_pipeline: bool = False
 	# if True, lowercases column names and applies the default renaming used in your notebook
 	auto_rename_columns: bool = True
 	# if True, creates engineered features: mechanical_power, wear_stress, temp_delta
@@ -328,6 +331,63 @@ class ClassificationPipeline:
 			underfit_max=config.underfit_max,
 		)
 
+		pipelines = best_pipeline = None
+		if config.return_best_pipeline:
+			# Build fitted sklearn Pipelines for saving/reuse.
+			# This trains a second time (pipeline-based) because the non-raw path
+			# trains on already-encoded/scaled matrices and does not retain fitted
+			# encoder/scaler objects.
+			try:
+				# Defaults aligned to your notebook
+				if config.pipeline_numeric_features is None:
+					num = [
+						"air_temp",
+						"process_temp",
+						"rotational_speed",
+						"torque",
+						"tool_wear",
+					]
+					if config.add_engineered_features:
+						num.extend(["mechanical_power", "wear_stress", "temp_delta"])
+					pipeline_numeric_features = num
+				else:
+					pipeline_numeric_features = list(config.pipeline_numeric_features)
+
+				pipeline_categorical_features = (
+					list(config.pipeline_categorical_features)
+					if config.pipeline_categorical_features is not None
+					else (list(config.categorical_features) if config.categorical_features is not None else [])
+				)
+
+				# Use the SAME split indices as the non-raw path.
+				X_train_raw = X_raw.loc[X_train.index]
+				X_test_raw = X_raw.loc[X_test.index]
+
+				pipe_results = ModelPipeline.train_classification_all(
+					X_train=X_train_raw,
+					y_train=y_train,
+					feature_engineer=fe_step,
+					model_types=config.pipeline_model_types,
+					numeric_features=pipeline_numeric_features,
+					categorical_features=pipeline_categorical_features,
+					encoding=config.pipeline_encoding,
+					scaler=config.scaler,
+					skew_threshold=config.pipeline_skew_threshold,
+					cv=config.cv,
+					scoring=config.scoring,
+					random_state=config.random_state,
+					n_jobs=config.n_jobs,
+					verbose=config.verbose,
+					refit=config.refit,
+					stratified_cv=config.stratified_cv,
+				)
+
+				best_pipe = ModelPipeline.select_best(pipe_results)
+				pipelines = {k: v.best_estimator for k, v in pipe_results.items()}
+				best_pipeline = best_pipe.best_estimator
+			except Exception:
+				pipelines = best_pipeline = None
+
 		roc_all = roc_best = cm_all = cm_best = None
 		if config.make_plots:
 			# In this path, models were trained on scaled+encoded matrices.
@@ -353,6 +413,17 @@ class ClassificationPipeline:
 			except Exception:
 				roc_all = roc_best = None
 
+			# In notebooks, matplotlib may auto-display any created figures at the end
+			# of the cell (inline backend). Close them immediately so they are only
+			# rendered when the user explicitly displays/prints them later.
+			try:
+				import matplotlib.pyplot as plt
+				for _fig in (roc_all, roc_best):
+					if _fig is not None:
+						plt.close(_fig)
+			except Exception:
+				pass
+
 			try:
 				cm_all = MT.plot_confusion_matrices(
 					models,
@@ -377,6 +448,14 @@ class ClassificationPipeline:
 			except Exception:
 				cm_all = cm_best = None
 
+			try:
+				import matplotlib.pyplot as plt
+				for _fig in (cm_all, cm_best):
+					if _fig is not None:
+						plt.close(_fig)
+			except Exception:
+				pass
+
 		return ClassificationPipelineResult(
 			config=config,
 			X=X_model,
@@ -390,6 +469,8 @@ class ClassificationPipeline:
 			models=models,
 			best_model=best_model,
 			metrics_table=metrics_table,
+			pipelines=pipelines,
+			best_pipeline=best_pipeline,
 			X_fe=X_fe,
 			X_train_fe=X_train_fe,
 			X_test_fe=X_test_fe,
@@ -546,6 +627,14 @@ class ClassificationPipeline:
 				roc_all = roc_best = None
 
 			try:
+				import matplotlib.pyplot as plt
+				for _fig in (roc_all, roc_best):
+					if _fig is not None:
+						plt.close(_fig)
+			except Exception:
+				pass
+
+			try:
 				cm_all = MT.plot_confusion_matrices(
 					pipelines,
 					X_test,
@@ -568,6 +657,14 @@ class ClassificationPipeline:
 				)
 			except Exception:
 				cm_all = cm_best = None
+
+			try:
+				import matplotlib.pyplot as plt
+				for _fig in (cm_all, cm_best):
+					if _fig is not None:
+						plt.close(_fig)
+			except Exception:
+				pass
 
 		# Return bundle; pipelines accept raw inputs and perform feature engineering internally.
 		return ClassificationPipelineResult(

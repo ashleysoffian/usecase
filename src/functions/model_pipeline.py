@@ -8,7 +8,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from functions.model import ModelTrainer
+from src.functions.model import ModelTrainer
 
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer, TransformedTargetRegressor

@@ -159,16 +159,10 @@ def format_context(docs: List[Document]):
 
 
 def retrieve_docs(retriever, question: str):
-	"""Compatibility wrapper across LangChain versions."""
-	if hasattr(retriever, "get_relevant_documents"):
-		return retriever.get_relevant_documents(question)
-	if hasattr(retriever, "invoke"):
-		return retriever.invoke(question)
-	if hasattr(retriever, "_get_relevant_documents"):
-		return retriever._get_relevant_documents(question)
-	raise AttributeError(
-		"Retriever has no supported retrieval method (expected get_relevant_documents/invoke)."
-	)
+	"""Retrieve documents using the modern LangChain retriever API."""
+	if not hasattr(retriever, "invoke"):
+		raise AttributeError("Retriever does not support invoke(question).")
+	return retriever.invoke(question)
 
 
 def answer_question(

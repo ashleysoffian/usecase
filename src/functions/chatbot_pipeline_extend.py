@@ -379,56 +379,114 @@ def ui_answer(
 	return out["answer"]
 
 
-def build_demo(
+def run_streamlit_app(
 	*,
 	persist_base: Optional[Path] = None,
 	config: PolicyQAConfig = PolicyQAConfig(),
 ):
-	"""Return a Gradio Blocks demo: upload file -> summary + QA."""
-	import gradio as gr
+	"""Streamlit UI: upload file -> index -> summary + QA.
 
-	with gr.Blocks() as demo:
-		gr.Markdown("# Document/Image Summarizer + QA\nUpload PDF/JPG/JPEG/PNG")
+	Run with:
+		streamlit run streamlit_app_extend.py
+	"""
+	import streamlit as st
 
-		with gr.Row():
-			pdf = gr.File(
-				label="Upload file (PDF/JPG/JPEG/PNG)",
-				file_types=[".pdf", ".jpg", ".jpeg", ".png"],
-				type="filepath",
-			)
-			index_btn = gr.Button("Submit")
+	st.set_page_config(page_title="Summarizer + QA", layout="centered")
+	st.title("Document/Image Summarizer + QA")
+	st.caption("Upload a PDF/JPG/JPEG/PNG, index it, then ask questions.")
 
-		status = gr.Markdown("")
-		uploaded_doc_id = gr.Textbox(label="Uploaded doc cache key", interactive=False)
-		summary = gr.Markdown("")
+	if "file_path" not in st.session_state:
+		st.session_state.file_path = None
+	if "uploaded_doc_id" not in st.session_state:
+		st.session_state.uploaded_doc_id = ""
+	if "summary" not in st.session_state:
+		st.session_state.summary = ""
+	if "answer" not in st.session_state:
+		st.session_state.answer = ""
+	if "status" not in st.session_state:
+		st.session_state.status = ""
 
-		question = gr.Textbox(
-			label="Ask a question",
-			placeholder="e.g., What is the document about?",
-			lines=2,
-		)
-		ask_btn = gr.Button("Ask")
-		answer = gr.Markdown("")
+	uploaded = st.file_uploader(
+		"Upload file",
+		type=["pdf", "jpg", "jpeg", "png"],
+		accept_multiple_files=False,
+	)
 
-		index_btn.click(
-			fn=lambda p: ui_index_uploaded(p, persist_base=persist_base, config=config),
-			inputs=[pdf],
-			outputs=[status, uploaded_doc_id, summary],
-		)
+	if uploaded is not None:
+		name = uploaded.name or "upload"
+		suffix = Path(name).suffix.lower()
+		if suffix not in {".pdf", *SUPPORTED_IMAGE_SUFFIXES}:
+			st.error("Unsupported file type. Please upload PDF/JPG/JPEG/PNG.")
+		else:
+			data = uploaded.getvalue()
+			doc_id = hashlib.sha256(data).hexdigest()
+			base = (persist_base or default_persist_base()).resolve()
+			upload_dir = base / "_uploads"
+			upload_dir.mkdir(parents=True, exist_ok=True)
+			upload_path = upload_dir / f"{doc_id[:16]}{suffix}"
+			if not upload_path.exists():
+				# Write once; subsequent reruns reuse the same file
+				upload_path.write_bytes(data)
+			st.session_state.file_path = str(upload_path)
+			st.session_state.status = f"Selected: {name}"
+			st.session_state.answer = ""
 
-		ask_btn.click(
-			fn=lambda q, did, p: ui_answer(
-				q,
-				did,
-				p,
+	cols = st.columns([1, 1])
+	with cols[0]:
+		index_clicked = st.button("Index", type="primary")
+	with cols[1]:
+		clear_clicked = st.button("Clear")
+
+	if clear_clicked:
+		st.session_state.file_path = None
+		st.session_state.uploaded_doc_id = ""
+		st.session_state.summary = ""
+		st.session_state.answer = ""
+		st.session_state.status = ""
+		st.rerun()
+
+	if index_clicked:
+		_require_openai_api_key()
+		with st.spinner("Indexing and generating summary..."):
+			status, doc_id, summary = ui_index_uploaded(
+				st.session_state.file_path,
 				persist_base=persist_base,
 				config=config,
-			),
-			inputs=[question, uploaded_doc_id, pdf],
-			outputs=[answer],
-		)
+			)
+			st.session_state.status = status
+			st.session_state.uploaded_doc_id = doc_id
+			st.session_state.summary = summary
+			st.session_state.answer = ""
 
-	return demo
+	if st.session_state.status:
+		st.info(st.session_state.status)
+
+	if st.session_state.summary:
+		st.subheader("Summary")
+		st.markdown(st.session_state.summary)
+
+	st.divider()
+	st.subheader("Q&A")
+	question = st.text_area(
+		"Ask a question",
+		placeholder="e.g., What is the document about?",
+		height=80,
+	)
+	ask_clicked = st.button("Ask")
+	if ask_clicked:
+		_require_openai_api_key()
+		with st.spinner("Answering..."):
+			st.session_state.answer = ui_answer(
+				question,
+				st.session_state.uploaded_doc_id,
+				st.session_state.file_path,
+				persist_base=persist_base,
+				config=config,
+			)
+
+	if st.session_state.answer:
+		st.subheader("Answer")
+		st.markdown(st.session_state.answer)
 
 
 def _require_openai_api_key():
@@ -439,21 +497,9 @@ def _require_openai_api_key():
 
 
 def main(argv: Optional[List[str]] = None):
-	parser = argparse.ArgumentParser(description="Policy QA Chatbot (Hybrid RAG) demo")
-	parser.add_argument(
-		"--persist-dir",
-		default=None,
-		help="Base directory for persisted Chroma stores.",
-	)
-	args = parser.parse_args(argv)
-
-	_require_openai_api_key()
-
-	persist_base = Path(args.persist_dir) if args.persist_dir else None
-	demo = build_demo(
-		persist_base=persist_base,
-	)
-	demo.launch()
+	# Streamlit must be launched with `streamlit run ...`, so this CLI just prints help.
+	print("This module now uses Streamlit (not Gradio).")
+	print("Run: streamlit run streamlit_app_extend.py")
 	return 0
 
 
